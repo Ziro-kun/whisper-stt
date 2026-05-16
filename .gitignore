@@ -1,0 +1,28 @@
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Logs
+*.log
+app_stdout.log
+run.log
+
+# Outputs
+outputs/
+
+# Screenshots / images (optional — remove if you want these tracked)
+*.png
+*.jpg
+*.jpeg
+
+# FFmpeg binary (download separately)
+ffmpeg/
+
+# Claude Code local settings
+.claude/

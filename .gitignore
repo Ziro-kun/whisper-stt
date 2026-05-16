@@ -24,5 +24,9 @@ outputs/
 # FFmpeg binary (download separately)
 ffmpeg/
 
+# Secrets
+.env
+.md
+
 # Claude Code local settings
 .claude/

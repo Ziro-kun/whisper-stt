@@ -38,13 +38,8 @@ _load_dotenv()
 # ── 설정 ──────────────────────────────────────────────────────────────────────
 
 HF_TOKEN      = os.environ.get("HF_TOKEN", "")
-WHISPER_REPO  = "ggerganov/whisper.cpp"
-WHISPER_GGUF  = "ggml-large-v3-turbo-q5_0.bin"
+WHISPER_MODEL = "o0dimplz0o/Whisper-Large-v3-turbo-STT-Zeroth-KO-v2"
 DIARIZE_MODEL = "pyannote/speaker-diarization-3.1"
-
-# whisper-cli 바이너리 탐색 (brew install whisper-cpp)
-import shutil as _shutil
-WHISPER_BIN = _shutil.which("whisper-cli") or _shutil.which("whisper-main") or "whisper-cli"
 OUTPUT_DIR    = Path("outputs")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -53,11 +48,11 @@ TORCH_DTYPE = torch.float16 if DEVICE in ("cuda", "mps") else torch.float32
 
 # ── 모델 상태 (백그라운드 로딩) ────────────────────────────────────────────────
 
-_model_ready     = False
-_model_error     = ""
-_load_log        = []
-asr_model_path   = None
-diarize_pipe     = None
+_model_ready  = False
+_model_error  = ""
+_load_log     = []
+asr_pipe      = None
+diarize_pipe  = None
 
 
 def _log(msg: str):
@@ -66,21 +61,37 @@ def _log(msg: str):
 
 
 def _load_models():
-    global _model_ready, _model_error, asr_model_path, diarize_pipe
+    global _model_ready, _model_error, asr_pipe, diarize_pipe
 
-    from huggingface_hub import hf_hub_download
+    from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
     from pyannote.audio import Pipeline as DiarizationPipeline
 
     try:
         _log(f"[로딩] 디바이스: {DEVICE}")
-        _log(f"[로딩] Whisper GGUF 모델 다운로드 중... ({WHISPER_GGUF}, 첫 실행 시 약 574MB)")
+        _log("[로딩] Whisper 모델 로딩 중... (첫 실행 시 수 GB 다운로드)")
 
-        asr_model_path = hf_hub_download(
-            repo_id=WHISPER_REPO,
-            filename=WHISPER_GGUF,
+        whisper_model = AutoModelForSpeechSeq2Seq.from_pretrained(
+            WHISPER_MODEL,
+            dtype=TORCH_DTYPE,
+            low_cpu_mem_usage=True,
+            use_safetensors=True,
             token=HF_TOKEN or None,
         )
-        _log("[로딩] Whisper GGUF 모델 준비 완료.")
+        whisper_model.to(DEVICE)
+
+        processor = AutoProcessor.from_pretrained(WHISPER_MODEL, token=HF_TOKEN or None)
+
+        asr_pipe = pipeline(
+            "automatic-speech-recognition",
+            model=whisper_model,
+            tokenizer=processor.tokenizer,
+            feature_extractor=processor.feature_extractor,
+            torch_dtype=TORCH_DTYPE,
+            device=DEVICE,
+            return_timestamps=True,
+            generate_kwargs={"language": "korean"},
+        )
+        _log("[로딩] Whisper 모델 준비 완료.")
 
         _log("[로딩] 화자 분리 모델 로딩 중...")
         diarize_pipe = DiarizationPipeline.from_pretrained(
@@ -100,7 +111,7 @@ def _load_models():
         _log("확인사항:")
         _log("  1. 인터넷 연결 상태 확인")
         _log(f"  2. HuggingFace 모델 사용 동의 필요: https://huggingface.co/{DIARIZE_MODEL}")
-        _log("  3. 디스크 공간 확인 (모델 약 2~3GB)")
+        _log("  3. 디스크 공간 확인 (모델 약 3~5GB)")
 
 
 # 백그라운드에서 모델 로딩 시작
@@ -182,71 +193,53 @@ def transcribe(audio_path: str, num_speakers: int | None, progress=None):
         duration_s = audio_info.duration
         dur_str = f"{int(duration_s // 60)}분 {int(duration_s % 60)}초"
 
-        # STT(CPU)와 화자분리(MPS)를 동시에 실행 — Apple Silicon 병렬 처리
-        yield f"STT + 화자 분리 병렬 처리 중... (오디오 {dur_str})\n{_progress_bar(0)}", None
+        # ── STT ──────────────────────────────────────────────────────────────────
+        yield f"전사(STT) 진행 중... (오디오 {dur_str})\n{_progress_bar(0)}", None
 
-        asr_result:     list = [None]
-        asr_error:      list = [None]
-        diarize_result: list = [None]
-        diarize_error:  list = [None]
-        asr_done     = threading.Event()
-        diarize_done = threading.Event()
+        result_holder: list = [None]
+        error_holder:  list = [None]
+        asr_done = threading.Event()
 
         def _run_asr():
-            import json, tempfile
-            out_dir = tempfile.mkdtemp()
-            out_prefix = os.path.join(out_dir, "out")
             try:
-                _log(f"[STT] 시작: {WHISPER_BIN}")
-                proc = subprocess.run(
-                    [
-                        WHISPER_BIN,
-                        "-m", asr_model_path,
-                        "-f", wav_path,
-                        "-l", "ko",
-                        "-oj",
-                        "-of", out_prefix,
-                    ],
-                    capture_output=True,
+                result_holder[0] = asr_pipe(
+                    wav_path,
+                    chunk_length_s=30,
+                    stride_length_s=5,
+                    return_timestamps=True,
                 )
-                if proc.returncode != 0:
-                    raise RuntimeError(
-                        f"whisper-cli 실패: {proc.stderr.decode(errors='replace').strip()}"
-                    )
-                out_json = out_prefix + ".json"
-                if not os.path.exists(out_json):
-                    raise RuntimeError("whisper-cli가 JSON을 생성하지 않았습니다.")
-                with open(out_json, encoding="utf-8") as f:
-                    data = json.load(f)
-                transcription = data.get("transcription", [])
-                asr_result[0] = {
-                    "chunks": [
-                        {
-                            "timestamp": (
-                                item["offsets"]["from"] / 1000.0,
-                                item["offsets"]["to"]  / 1000.0,
-                            ),
-                            "text": item["text"].strip(),
-                        }
-                        for item in transcription
-                        if item.get("text", "").strip()
-                    ]
-                }
-                _log(f"[STT] 완료: {len(asr_result[0]['chunks'])}개 청크")
             except Exception as e:
-                asr_error[0] = e
-                _log(f"[STT] 오류: {e}")
+                error_holder[0] = e
             finally:
-                try:
-                    import shutil
-                    shutil.rmtree(out_dir, ignore_errors=True)
-                except Exception:
-                    pass
                 asr_done.set()
+
+        threading.Thread(target=_run_asr, daemon=True).start()
+
+        CYCLE = 60.0
+        t0 = time.time()
+        while not asr_done.wait(timeout=2):
+            elapsed = time.time() - t0
+            frac = (elapsed % CYCLE) / CYCLE
+            elapsed_str = f"{int(elapsed // 60)}분 {int(elapsed % 60)}초 경과"
+            if progress:
+                progress(0.1 + min(elapsed / 1800, 0.55), desc=f"전사 중... {elapsed_str}")
+            yield f"전사(STT) 진행 중... (오디오 {dur_str})\n{_progress_bar(frac)}  {elapsed_str}", None
+
+        if error_holder[0]:
+            raise error_holder[0]
+
+        chunks = result_holder[0].get("chunks", [])
+        if not chunks:
+            yield "전사 결과가 없습니다. 오디오를 확인해 주세요.", None
+            return
+
+        # ── 화자 분리 ─────────────────────────────────────────────────────────────
+        diarize_holder: list = [None]
+        diarize_error:  list = [None]
+        diarize_done = threading.Event()
 
         def _run_diarize():
             try:
-                _log("[화자분리] 시작")
                 diarize_kwargs = {}
                 if num_speakers and num_speakers > 0:
                     diarize_kwargs["num_speakers"] = num_speakers
@@ -259,52 +252,31 @@ def transcribe(audio_path: str, num_speakers: int | None, progress=None):
                     **diarize_kwargs,
                 )
                 if hasattr(result, "itertracks"):
-                    diarize_result[0] = result
+                    diarize_holder[0] = result
                 elif hasattr(result, "speaker_diarization"):
-                    diarize_result[0] = result.speaker_diarization
+                    diarize_holder[0] = result.speaker_diarization
                 else:
-                    diarize_result[0] = result
-                _log("[화자분리] 완료")
+                    diarize_holder[0] = result
             except Exception as e:
                 diarize_error[0] = e
-                _log(f"[화자분리] 오류: {e}")
             finally:
                 diarize_done.set()
 
-        threading.Thread(target=_run_asr,     daemon=True).start()
         threading.Thread(target=_run_diarize, daemon=True).start()
 
         t0 = time.time()
-        CYCLE = 60.0  # 바가 한 번 채워지는 주기(초) — 시각적 피드백용
-
-        while not (asr_done.is_set() and diarize_done.is_set()):
-            elapsed  = time.time() - t0
-            frac     = (elapsed % CYCLE) / CYCLE   # 주기적으로 리셋 → 절대 멈추지 않음
-            bar      = _progress_bar(frac)
+        while not diarize_done.wait(timeout=2):
+            elapsed = time.time() - t0
+            frac = (elapsed % CYCLE) / CYCLE
             elapsed_str = f"{int(elapsed // 60)}분 {int(elapsed % 60)}초 경과"
-            stt_tag  = "완료" if asr_done.is_set()     else "진행 중"
-            diar_tag = "완료" if diarize_done.is_set() else "진행 중"
-            msg = (
-                f"STT: {stt_tag}  |  화자 분리: {diar_tag}\n"
-                f"{bar}  {elapsed_str}"
-            )
             if progress:
-                progress(0.1 + min(elapsed / 600, 0.8), desc=msg)
-            yield msg, None
-            asr_done.wait(timeout=1)
-            diarize_done.wait(timeout=1)
+                progress(0.65 + min(elapsed / 1800, 0.3), desc=f"화자 분리 중... {elapsed_str}")
+            yield f"화자 분리 중...\n{_progress_bar(frac)}  {elapsed_str}", None
 
-        if asr_error[0]:
-            raise asr_error[0]
         if diarize_error[0]:
             raise diarize_error[0]
 
-        chunks = asr_result[0].get("chunks", [])
-        if not chunks:
-            yield "전사 결과가 없습니다. 오디오를 확인해 주세요.", None
-            return
-
-        diarization = diarize_result[0]
+        diarization = diarize_holder[0]
 
         lines = []
         prev_speaker = None
@@ -414,4 +386,4 @@ with gr.Blocks(title="한국어 STT 녹취록", css=CSS, theme=gr.themes.Soft())
 if __name__ == "__main__":
     print(f"Gradio 서버 시작 중... http://localhost:7860", flush=True)
     demo.queue()
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=False)
+    demo.launch(server_name="0.0.0.0", server_port=7860, share=False, inbrowser=True)

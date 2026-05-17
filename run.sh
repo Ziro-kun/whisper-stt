@@ -44,29 +44,21 @@ fi
 
 # ── [3/4] 패키지 설치 확인 ────────────────────────────────────────────────────
 if ! "$VENV_PY" -c "import torch, transformers, gradio, pyannote" 2>/dev/null; then
-    log "[3/5] 패키지 설치 중... (최초 실행 시 5~10분 소요)"
+    log "[3/4] 패키지 설치 중... (최초 실행 시 5~10분 소요)"
     "$VENV_PY" -m pip install --quiet --upgrade pip
     "$VENV_PY" -m pip install --quiet -r "$APP_DIR/requirements.txt"
-    log "[3/5] 설치 완료"
+    log "[3/4] 설치 완료"
 else
-    log "[3/5] 패키지 OK"
+    log "[3/4] 패키지 OK"
 fi
 
-# ── [4/5] ffmpeg 확인 ─────────────────────────────────────────────────────────
+# ── [4/4] ffmpeg 확인 ─────────────────────────────────────────────────────────
 if ! command -v ffmpeg &>/dev/null; then
-    log "[4/5] ffmpeg를 찾을 수 없습니다."
+    log "[4/4] ffmpeg를 찾을 수 없습니다."
     log "  설치: brew install ffmpeg"
     exit 1
 else
-    log "[4/5] ffmpeg OK ($(ffmpeg -version 2>&1 | head -1))"
-fi
-
-# ── [5/5] whisper-cli 확인 ────────────────────────────────────────────────────
-if ! command -v whisper-cli &>/dev/null && ! command -v whisper-main &>/dev/null; then
-    log "[5/5] whisper-cpp 설치 중..."
-    brew install whisper-cpp
-else
-    log "[5/5] whisper-cli OK"
+    log "[4/4] ffmpeg OK ($(ffmpeg -version 2>&1 | head -1))"
 fi
 
 # ── .env 로드 ─────────────────────────────────────────────────────────────────

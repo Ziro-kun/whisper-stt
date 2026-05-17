@@ -27,9 +27,8 @@ ffmpeg/
 # Secrets
 .env
 
-# Docs (기획문서 등 내부 문서)
-SPEC.md
-STT_기획문서.md
+# Internal docs (기획문서 등)
+docs/
 
 # Claude Code local settings
 .claude/

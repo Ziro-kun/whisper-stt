@@ -1,6 +1,6 @@
 # 한국어 STT 녹취록
 
-클로바노트처럼 음성 파일을 업로드하면 **타임스탬프 + 화자 분리**가 포함된 한국어 녹취록을 자동 생성하는 로컬 실행 앱.  
+클로바노트처럼 음성 파일을 업로드하면 **타임스탬프 + 화자 분리**가 포함된 한국어 녹취록을 자동 생성하는 로컬 실행 앱
 파일이 외부 서버로 전송되지 않으며, 최초 모델 다운로드 이후에는 인터넷 없이도 동작한다.
 
 ---
@@ -11,7 +11,7 @@
 |------|------|
 | 보안 | 음성 파일이 외부로 전송되지 않음 |
 | 비용 | 무료 (클라우드 STT API 불필요) |
-| 기능 | 타임스탬프 + 화자 분리 — 클로바노트와 동일 수준 |
+| 기능 | 타임스탬프 + 화자 분리 — 클로바노트 결과물과 유사 |
 | 플랫폼 | macOS Apple Silicon (MPS 가속) |
 
 ---
@@ -56,8 +56,8 @@ Whisper Large v3 turbo       pyannote/speaker-diarization-3.1
 
 ### STT 모델
 
-OpenAI Whisper Large v3 turbo를 Zeroth-Korean 데이터셋으로 파인튜닝한 모델.  
-기본 turbo 모델 대비 한국어 구어체 인식률이 향상되어 있다.
+OpenAI Whisper Large v3 turbo를 Zeroth-Korean 데이터셋으로 파인튜닝한 모델로
+기본 turbo 모델 대비 한국어 구어체 인식률이 향상되어 있다.(개발 과정에서 자체 비교 완료)
 
 ### 화자 분리 모델
 
@@ -110,7 +110,7 @@ HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 ### 2. 실행(MacOS 기준)
 
-`run.command` 파일을 더블클릭.
+`run.command` 파일을 더블클릭
 
 처음 실행 시 자동으로:
 1. Python 가상환경 생성

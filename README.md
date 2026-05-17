@@ -108,9 +108,9 @@ HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 토큰 발급: https://huggingface.co/settings/tokens
 
-### 2. 실행
+### 2. 실행(MacOS 기준)
 
-`STT 녹취록.command` 파일을 더블클릭.
+`run.command` 파일을 더블클릭.
 
 처음 실행 시 자동으로:
 1. Python 가상환경 생성

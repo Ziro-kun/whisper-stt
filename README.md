@@ -19,50 +19,60 @@
 ## 시스템 구조
 
 ```
-오디오 파일 업로드
+오디오 파일 업로드 (mp3, wav, m4a 등)
        │
        ▼
-[오디오 전처리]
- soundfile / ffmpeg → 16kHz mono WAV
+[오디오 전처리]                    soundfile (1차) → 실패 시 ffmpeg 서브프로세스 (2차)
+ 16kHz mono WAV 변환
+       │
+       ▼
+[VAD 전처리]                       torch.hub "snakers4/silero-vad" (JIT 모델, CPU 고정)
+ 무음 구간 제거 → 음성 구간만 이어붙임    get_speech_timestamps(threshold=UI 슬라이더, 기본 0.5)
        │
        ├──────────────────────────────┐
        ▼                              ▼
 [STT]                        [화자 분리]
-Whisper Large v3 turbo       pyannote/speaker-diarization-3.1
-(한국어 파인튜닝, MPS)         (MPS)
-타임스탬프 청크 단위 전사       화자별 발화 구간 생성
+transformers pipeline         pyannote.audio Pipeline
+("automatic-speech-recognition")   (원본 16kHz WAV 전체 입력, MPS/CUDA 가속)
+Whisper Large v3 turbo 파인튜닝     pyannote/speaker-diarization-3.1
+chunk_length_s=30, stride=5       화자별 발화 구간(RTTM) 생성
+(VAD 처리된 오디오 입력)
+       │                              │
+       ▼                              │
+[환각(hallucination) 필터]           │
+ 반복 어절(≥3회)·반복 문자(≥10회)      │
+ 감지 시 해당 청크 제거 (순수 파이썬)   │
        │                              │
        └──────────────┬───────────────┘
                       ▼
               [청크 ↔ 화자 매핑]
-              구간 겹침 기반 할당
+              구간 겹침 기반 할당 (순수 파이썬, assign_speaker)
                       │
                       ▼
-              [결과 저장 + 미리보기]
+              [결과 저장 + 미리보기]        Gradio UI
               outputs/파일명_YYYYMMDD_HHMMSS.txt
 ```
 
+> **알려진 한계**: STT는 VAD로 무음을 제거한 오디오 기준 타임스탬프를 쓰고, 화자 분리는 원본 오디오 전체를 기준으로 하기 때문에 두 타임라인이 정확히 일치하지 않을 수 있다. 무음 구간이 많은 오디오일수록 화자 매핑 오차가 커질 수 있음 — 다음 개선 항목.
+
 ---
 
-## 사용 모델
+## 모델 · 패키지 · 라이브러리 스택
 
-| 역할 | 모델 |
-|------|------|
-| STT | `o0dimplz0o/Whisper-Large-v3-turbo-STT-Zeroth-KO-v2` |
-| 화자 분리 | `pyannote/speaker-diarization-3.1` |
+| 레이어 | 역할 | 실제 구현체 | 비고 |
+|------|------|------|------|
+| STT 모델 | 음성 → 텍스트 | `o0dimplz0o/Whisper-Large-v3-turbo-STT-Zeroth-KO-v2` (HuggingFace) | Whisper large-v3-turbo를 Zeroth-Korean으로 파인튜닝 |
+| STT 추론 엔진 | 모델 로딩·추론·청킹·타임스탬프 | `transformers.pipeline("automatic-speech-recognition")` | **`transformers==4.46.3` 버전 고정 필수** — 5.x대에서 30초 이상 오디오의 long-form 타임스탬프가 반복적으로 리셋되는 회귀 버그 확인됨 |
+| VAD (음성 구간 감지) | 무음 구간 제거 | `torch.hub.load("snakers4/silero-vad", "silero_vad")` (JIT 모델) | GPU/MPS 그래프 퓨저 미지원 이슈로 CPU 고정 실행. 오디오 1분당 약 0.3초 수준으로 매우 가벼움 |
+| 화자 분리 모델 | 화자별 발화 구간 추정 | `pyannote/speaker-diarization-3.1` (내부적으로 `pyannote/segmentation-3.0` 의존) | `pyannote-audio` 라이브러리, HuggingFace 접근 동의 필요 |
+| 환각 필터 | 반복·무의미 텍스트 제거 | 자체 구현 (`is_hallucination`, 순수 파이썬) | 동일 어절 3회 이상 반복 또는 동일 문자 10회 이상 반복 시 해당 청크 폐기 |
+| 오디오 I/O | 파일 읽기/쓰기, 리샘플링 | `soundfile`, `resampy` | 실패 시 `ffmpeg` 서브프로세스로 폴백 |
+| ML 프레임워크 | 텐서 연산, 디바이스 가속 | `torch` (`torch.backends.mps`) | 디바이스 우선순위: CUDA → MPS(Apple Silicon) → CPU |
+| 모델 로딩 최적화 | 저메모리 로딩 | `accelerate` | `low_cpu_mem_usage=True` |
+| 모델 허브 | 모델 다운로드·캐시 | `huggingface_hub` | 최초 실행 시 약 3~5GB 다운로드, 이후 로컬 캐시 |
+| UI | 웹 인터페이스 | `gradio` | 화자 수 입력, VAD 민감도 슬라이더, 진행률 표시 |
 
-- 두 모델 모두 첫 실행 시 HuggingFace에서 자동 다운로드 (합계 약 3~5GB)
-- 이후 실행부터는 로컬 캐시에서 즉시 로딩
-
-### STT 모델
-
-OpenAI Whisper Large v3 turbo를 Zeroth-Korean 데이터셋으로 파인튜닝한 모델로
-기본 turbo 모델 대비 한국어 구어체 인식률이 향상되어 있다.(개발 과정에서 자체 비교 완료)
-
-### 화자 분리 모델
-
-pyannote 3.x는 오픈소스 화자 분리 모델 중 정확도가 높은 편이며,  
-별도 학습 없이 한국어 오디오에 바로 적용 가능하다.
+두 STT/화자분리 모델 모두 첫 실행 시 HuggingFace에서 자동 다운로드되며, 이후에는 로컬 캐시에서 즉시 로딩된다.
 
 ---
 
@@ -121,27 +131,33 @@ HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ### 3. 사용법
 
 1. 브라우저에서 오디오 파일 업로드 (mp3, wav, m4a 등)
-2. 화자 수 입력 (모를 경우 0 → 자동 감지)
-3. **변환 시작** 클릭
-4. 완료 후 미리보기 확인 및 `.txt` 파일 다운로드
+2. 화자 수 입력 (모를 경우 0 → 자동 감지. 단, 긴 오디오는 자동 감지보다 직접 지정 권장 — 알려진 제약 참고)
+3. (선택) "VAD 고급 설정"에서 민감도 조절 — 높을수록 음성만 추출, 낮을수록 노이즈도 포함 (기본 0.5)
+4. **변환 시작** 클릭
+5. 완료 후 미리보기 확인 및 `.txt` 파일 다운로드
 
 ---
 
 ## 성능 참고
 
-| 환경 | 오디오 1시간 처리 시간 (참고) |
-|------|---------------------------|
-| Apple M4 (MPS) | 약 30~60분 |
-| NVIDIA GPU (CUDA) | 약 10~20분 |
+실제 통화 녹음 3개(131초/176초/558초)로 실측한 값 (Apple Silicon, MPS):
 
-처리 시간의 대부분은 화자 분리(pyannote) 단계에서 소요된다.
+| 오디오 길이 | VAD | STT | 화자 분리 | 합계 | 실시간 대비 |
+|---|---|---|---|---|---|
+| 131.2초 | 0.4초 | 10.0초 | 10.6초 | 21.0초 | 약 16% |
+| 175.8초 | 0.5초 | 12.3초 | 14.3초 | 27.1초 | 약 15% |
+| 557.9초 | 1.4초 | 64.2초 | 45.9초 | 111.5초 | 약 20% |
+
+MPS 기준 오디오 길이의 약 15~20% 수준 처리 시간이 걸린다 (1시간 오디오 ≈ 9~12분). VAD 자체는 매우 가볍고, STT와 화자 분리가 비슷한 비중을 차지한다. 겹침 비율이 늘어나도 처리 속도 자체는 크게 변하지 않는다 (화자 분리의 고정 비용이 지배적).
 
 ---
 
 ## 알려진 제약
 
 - **처리 속도**: 로컬 모델 특성상 클라우드 서비스보다 느림
-- **겹치는 발화**: 두 화자가 동시에 말하는 구간은 한 명만 할당됨
+- **겹치는 발화**: 두 화자가 동시에 말하는 구간은 한 명만 할당됨 (겹침 구간 자체를 분리 인식하지 못함)
+- **VAD-화자분리 타임라인 불일치**: STT는 VAD로 무음을 제거한 오디오 기준, 화자 분리는 원본 오디오 기준으로 동작해 두 타임라인이 어긋날 수 있음 — 무음이 많은 오디오일수록 화자 매핑 오차 위험 증가
+- **화자 수 자동 감지 불안정**: 긴 오디오(수 분 이상)에서 화자 수를 자동 감지하면 실제보다 화자가 과도하게 분할되는 경향 확인됨 — 화자 수를 직접 지정하는 것을 권장
 - **배경 소음**: 전사 품질에 영향을 미침 (별도 노이즈 제거 없음)
 - **실시간 처리 불가**: 파일 업로드 후 일괄 처리 방식
 - **마이크 입력 미지원**: 파일 업로드만 지원

@@ -18,40 +18,25 @@
 
 ## 시스템 구조
 
+```mermaid
+flowchart TD
+    A["오디오 파일 업로드<br/>mp3, wav, m4a 등"] --> B["오디오 전처리<br/>soundfile(1차) → ffmpeg 서브프로세스(2차)<br/>16kHz mono WAV 변환"]
+
+    B --> C["VAD 전처리<br/>torch.hub snakers4/silero-vad (JIT, CPU 고정)<br/>get_speech_timestamps(threshold=UI 슬라이더, 기본 0.5)<br/>무음 구간 제거 후 음성 구간만 이어붙임"]
+
+    C --> D["STT<br/>transformers.pipeline('automatic-speech-recognition')<br/>Whisper Large v3 turbo 파인튜닝<br/>chunk_length_s=30, stride_length_s=5<br/>(VAD 처리된 오디오 입력)"]
+
+    B --> E["화자 분리<br/>pyannote.audio Pipeline<br/>pyannote/speaker-diarization-3.1<br/>(원본 16kHz WAV 전체 입력, MPS/CUDA 가속)"]
+
+    D --> F["환각(hallucination) 필터<br/>is_hallucination() 순수 파이썬<br/>반복 어절(≥3회) · 반복 문자(≥10회) 청크 제거"]
+
+    F --> G["청크 ↔ 화자 매핑<br/>assign_speaker() 순수 파이썬<br/>구간 겹침 기반 할당"]
+    E --> G
+
+    G --> H["결과 저장 + 미리보기<br/>Gradio UI<br/>outputs/파일명_YYYYMMDD_HHMMSS.txt"]
 ```
-오디오 파일 업로드 (mp3, wav, m4a 등)
-       │
-       ▼
-[오디오 전처리]                    soundfile (1차) → 실패 시 ffmpeg 서브프로세스 (2차)
- 16kHz mono WAV 변환
-       │
-       ▼
-[VAD 전처리]                       torch.hub "snakers4/silero-vad" (JIT 모델, CPU 고정)
- 무음 구간 제거 → 음성 구간만 이어붙임    get_speech_timestamps(threshold=UI 슬라이더, 기본 0.5)
-       │
-       ├──────────────────────────────┐
-       ▼                              ▼
-[STT]                        [화자 분리]
-transformers pipeline         pyannote.audio Pipeline
-("automatic-speech-recognition")   (원본 16kHz WAV 전체 입력, MPS/CUDA 가속)
-Whisper Large v3 turbo 파인튜닝     pyannote/speaker-diarization-3.1
-chunk_length_s=30, stride=5       화자별 발화 구간(RTTM) 생성
-(VAD 처리된 오디오 입력)
-       │                              │
-       ▼                              │
-[환각(hallucination) 필터]           │
- 반복 어절(≥3회)·반복 문자(≥10회)      │
- 감지 시 해당 청크 제거 (순수 파이썬)   │
-       │                              │
-       └──────────────┬───────────────┘
-                      ▼
-              [청크 ↔ 화자 매핑]
-              구간 겹침 기반 할당 (순수 파이썬, assign_speaker)
-                      │
-                      ▼
-              [결과 저장 + 미리보기]        Gradio UI
-              outputs/파일명_YYYYMMDD_HHMMSS.txt
-```
+
+STT는 VAD를 거친 오디오(C)를, 화자 분리는 원본 오디오(B)를 그대로 입력받는다 — 이 갈라지는 지점이 아래 알려진 한계의 원인이다.
 
 > **알려진 한계**: STT는 VAD로 무음을 제거한 오디오 기준 타임스탬프를 쓰고, 화자 분리는 원본 오디오 전체를 기준으로 하기 때문에 두 타임라인이 정확히 일치하지 않을 수 있다. 무음 구간이 많은 오디오일수록 화자 매핑 오차가 커질 수 있음 — 다음 개선 항목.
 

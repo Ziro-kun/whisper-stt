@@ -15,7 +15,7 @@ echo ""
 
 # ── [1/4] Python 탐색 ──────────────────────────────────────────────────────────
 PY_CMD=""
-for cmd in python3.12 python3.11 python3; do
+for cmd in python3.13 python3.12 python3.11 python3; do
     if command -v "$cmd" &>/dev/null; then
         ver=$("$cmd" -c "import sys; v=sys.version_info; print(v.major, v.minor)")
         major=$(echo "$ver" | cut -d' ' -f1)

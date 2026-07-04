@@ -81,6 +81,11 @@ def _log(msg: str):
     _load_log.append(msg)
 
 
+def _log_timed(msg: str):
+    now = datetime.datetime.now().strftime("%H:%M:%S")
+    print(f"[{now}] {msg}", flush=True)
+
+
 def _load_models():
     global _model_ready, _model_error, asr_pipe, diarize_pipe, vad_model, vad_get_speech_timestamps
 
@@ -298,7 +303,10 @@ def transcribe(audio_path: str, num_speakers: int | None, vad_threshold: float, 
         return
 
     wav_path = None
+    job_t0 = time.time()
     try:
+        _log_timed(f"[전사 시작] 파일: {Path(audio_path).name}")
+
         if progress:
             progress(0.0, desc="오디오 변환 중...")
         yield "오디오 변환 중...", None
@@ -307,13 +315,16 @@ def transcribe(audio_path: str, num_speakers: int | None, vad_threshold: float, 
         audio_info = sf.info(wav_path)
         duration_s = audio_info.duration
         dur_str = f"{int(duration_s // 60)}분 {int(duration_s % 60)}초"
+        _log_timed(f"[오디오 변환 완료] 길이: {dur_str} ({duration_s:.1f}초)")
 
         # ── VAD 전처리 ────────────────────────────────────────────────────────────
         if progress:
             progress(0.05, desc="음성 구간 감지 중...")
         yield "음성 구간 감지 중...", None
 
+        vad_t0 = time.time()
         processed_wav_path, voice_segments = extract_voice_segments(wav_path, threshold=vad_threshold)
+        _log_timed(f"[VAD 완료] 소요: {time.time() - vad_t0:.1f}초")
 
         # ── STT ──────────────────────────────────────────────────────────────────
         yield f"전사(STT) 진행 중... (오디오 {dur_str})\n{_progress_bar(0)}", None
@@ -361,6 +372,8 @@ def transcribe(audio_path: str, num_speakers: int | None, vad_threshold: float, 
 
         if error_holder[0]:
             raise error_holder[0]
+
+        _log_timed(f"[STT 완료] 소요: {time.time() - t0:.1f}초")
 
         chunks = result_holder[0].get("chunks", [])
 
@@ -420,6 +433,8 @@ def transcribe(audio_path: str, num_speakers: int | None, vad_threshold: float, 
         if diarize_error[0]:
             raise diarize_error[0]
 
+        _log_timed(f"[화자분리 완료] 소요: {time.time() - t0:.1f}초")
+
         diarization = diarize_holder[0]
 
         lines = []
@@ -449,11 +464,16 @@ def transcribe(audio_path: str, num_speakers: int | None, vad_threshold: float, 
         save_path = OUTPUT_DIR / f"{stem}_{timestamp}.txt"
         save_path.write_text(output_text, encoding="utf-8")
 
+        total_elapsed = time.time() - job_t0
+        ratio = f"{total_elapsed / duration_s * 100:.1f}%" if duration_s else "N/A"
+        _log_timed(f"[전체 완료] 총 소요: {total_elapsed:.1f}초 (오디오 길이 대비 {ratio}) → {save_path.name}")
+
         if progress:
             progress(1.0, desc="완료")
         yield output_text, str(save_path)
 
     except Exception as e:
+        _log_timed(f"[오류] {e} (실패 전까지 소요: {time.time() - job_t0:.1f}초)")
         yield f"[오류] {e}", None
 
     finally:

@@ -20,6 +20,25 @@ import torch
 import gradio as gr
 import soundfile as sf
 from pathlib import Path
+import numpy as np
+
+# PyTorch 2.6 weights_only 호환성 (pyannote 모델 로드)
+import torch.serialization
+torch.serialization.add_safe_globals([torch.torch_version.TorchVersion])
+import torch._utils
+for name in dir(torch._utils):
+    if name.startswith('_rebuild'):
+        torch.serialization.add_safe_globals([getattr(torch._utils, name)])
+
+_original_torch_load = torch.load
+def _patched_torch_load(f, *args, **kwargs):
+    try:
+        kwargs_copy = kwargs.copy()
+        kwargs_copy['weights_only'] = False
+        return _original_torch_load(f, *args, **kwargs_copy)
+    except:
+        return _original_torch_load(f, *args, **kwargs)
+torch.load = _patched_torch_load
 
 
 def _load_dotenv():
@@ -53,6 +72,8 @@ _model_error  = ""
 _load_log     = []
 asr_pipe      = None
 diarize_pipe  = None
+vad_model     = None
+vad_get_speech_timestamps = None
 
 
 def _log(msg: str):
@@ -61,7 +82,7 @@ def _log(msg: str):
 
 
 def _load_models():
-    global _model_ready, _model_error, asr_pipe, diarize_pipe
+    global _model_ready, _model_error, asr_pipe, diarize_pipe, vad_model, vad_get_speech_timestamps
 
     from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
     from pyannote.audio import Pipeline as DiarizationPipeline
@@ -70,33 +91,43 @@ def _load_models():
         _log(f"[로딩] 디바이스: {DEVICE}")
         _log("[로딩] Whisper 모델 로딩 중... (첫 실행 시 수 GB 다운로드)")
 
-        whisper_model = AutoModelForSpeechSeq2Seq.from_pretrained(
+        processor = AutoProcessor.from_pretrained(WHISPER_MODEL, token=HF_TOKEN or None)
+        model = AutoModelForSpeechSeq2Seq.from_pretrained(
             WHISPER_MODEL,
-            dtype=TORCH_DTYPE,
+            torch_dtype=TORCH_DTYPE,
             low_cpu_mem_usage=True,
-            use_safetensors=True,
             token=HF_TOKEN or None,
         )
-        whisper_model.to(DEVICE)
-
-        processor = AutoProcessor.from_pretrained(WHISPER_MODEL, token=HF_TOKEN or None)
+        if DEVICE in ("cuda", "mps"):
+            model = model.to(DEVICE)
 
         asr_pipe = pipeline(
             "automatic-speech-recognition",
-            model=whisper_model,
+            model=model,
             tokenizer=processor.tokenizer,
             feature_extractor=processor.feature_extractor,
             torch_dtype=TORCH_DTYPE,
-            device=DEVICE,
-            return_timestamps=True,
-            generate_kwargs={"language": "korean"},
+            device=DEVICE if DEVICE in ("cuda", "mps") else -1,
         )
         _log("[로딩] Whisper 모델 준비 완료.")
+
+        _log("[로딩] VAD(음성 감지) 모델 로딩 중...")
+        try:
+            vad_model, vad_utils = torch.hub.load('snakers4/silero-vad', 'silero_vad', force_reload=False)
+            vad_get_speech_timestamps = vad_utils[0]
+        except:
+            # torch.hub 실패 시 직접 로드
+            from silero_vad import load_silero_vad, get_speech_timestamps
+            vad_model = load_silero_vad()
+            vad_get_speech_timestamps = get_speech_timestamps
+        if DEVICE == "cuda":  # MPS는 silero-vad JIT 모델의 그래프 퓨저를 지원하지 않아 CPU 고정
+            vad_model = vad_model.to(DEVICE)
+        _log("[로딩] VAD 모델 준비 완료.")
 
         _log("[로딩] 화자 분리 모델 로딩 중...")
         diarize_pipe = DiarizationPipeline.from_pretrained(
             DIARIZE_MODEL,
-            token=HF_TOKEN or None,
+            token=HF_TOKEN or True,
         )
         if DEVICE in ("cuda", "mps"):
             diarize_pipe.to(torch.device(DEVICE))
@@ -116,6 +147,90 @@ def _load_models():
 
 # 백그라운드에서 모델 로딩 시작
 threading.Thread(target=_load_models, daemon=True).start()
+
+
+# ── VAD 전처리 ────────────────────────────────────────────────────────────────
+
+def extract_voice_segments(wav_path: str, threshold: float = 0.5) -> tuple[str, list]:
+    """
+    VAD로 음성 구간만 추출하고, 구간 정보를 반환
+
+    Returns:
+        (processed_wav_path, segments_info)
+        segments_info: [(start_sec, end_sec), ...]
+    """
+    try:
+        wav_data, sr = sf.read(wav_path)
+        if wav_data.ndim > 1:
+            wav_data = wav_data.mean(axis=1)
+
+        # 16kHz로 변환 (VAD 모델 요구사항)
+        if sr != 16000:
+            import resampy
+            wav_data = resampy.resample(wav_data, sr, 16000)
+            sr = 16000
+
+        # VAD 처리
+        wav_tensor = torch.from_numpy(wav_data).float()
+        if DEVICE == "cuda":
+            wav_tensor = wav_tensor.to(DEVICE)
+
+        speech_timestamps = vad_get_speech_timestamps(
+            wav_tensor, vad_model, threshold=threshold, sampling_rate=sr, return_seconds=False
+        )
+        segments = [(ts["start"] / sr, ts["end"] / sr) for ts in speech_timestamps]
+
+        # 음성 구간만 추출해서 이어 붙이기
+        if not segments:
+            # 음성이 없으면 전체 반환 (에러 방지)
+            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            tmp.close()
+            sf.write(tmp.name, wav_data, sr)
+            return tmp.name, [(0, len(wav_data) / sr)]
+
+        processed_data = []
+        for start_sec, end_sec in segments:
+            start_idx = int(start_sec * sr)
+            end_idx = int(end_sec * sr)
+            processed_data.append(wav_data[start_idx:end_idx])
+
+        processed_wav = np.concatenate(processed_data)
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp.close()
+        sf.write(tmp.name, processed_wav, sr)
+
+        return tmp.name, segments
+
+    except Exception as e:
+        _log(f"[경고] VAD 처리 실패: {e}. 원본 오디오 사용합니다.")
+        return wav_path, [(0, 0)]
+
+
+# ── 환각 필터 ─────────────────────────────────────────────────────────────────
+
+def is_hallucination(text: str) -> bool:
+    """
+    반복되거나 무의미한 텍스트 감지
+    """
+    if not text or len(text.strip()) == 0:
+        return True
+
+    words = text.split()
+    if not words:
+        return True
+
+    # 같은 어절이 3회 이상 반복
+    for word in set(words):
+        if words.count(word) >= 3:
+            return True
+
+    # 단일 문자가 10회 이상 반복 (예: "... 아아아아아...")
+    for char in set(text):
+        if char.isalpha() and text.count(char) >= 10:
+            return True
+
+    return False
 
 
 # ── 유틸 함수 ─────────────────────────────────────────────────────────────────
@@ -169,7 +284,7 @@ def load_audio_as_wav(file_path: str) -> str:
 
 # ── 핵심 처리 ─────────────────────────────────────────────────────────────────
 
-def transcribe(audio_path: str, num_speakers: int | None, progress=None):
+def transcribe(audio_path: str, num_speakers: int | None, vad_threshold: float, progress=None):
     if not _model_ready:
         if _model_error:
             yield f"모델 로딩 실패:\n{_model_error}\n\nhttps://huggingface.co/{DIARIZE_MODEL} 에서 사용 동의 후 재시작하세요.", None
@@ -193,6 +308,13 @@ def transcribe(audio_path: str, num_speakers: int | None, progress=None):
         duration_s = audio_info.duration
         dur_str = f"{int(duration_s // 60)}분 {int(duration_s % 60)}초"
 
+        # ── VAD 전처리 ────────────────────────────────────────────────────────────
+        if progress:
+            progress(0.05, desc="음성 구간 감지 중...")
+        yield "음성 구간 감지 중...", None
+
+        processed_wav_path, voice_segments = extract_voice_segments(wav_path, threshold=vad_threshold)
+
         # ── STT ──────────────────────────────────────────────────────────────────
         yield f"전사(STT) 진행 중... (오디오 {dur_str})\n{_progress_bar(0)}", None
 
@@ -202,12 +324,24 @@ def transcribe(audio_path: str, num_speakers: int | None, progress=None):
 
         def _run_asr():
             try:
-                result_holder[0] = asr_pipe(
-                    wav_path,
+                result = asr_pipe(
+                    processed_wav_path,
                     chunk_length_s=30,
                     stride_length_s=5,
+                    generate_kwargs={"language": "ko", "task": "transcribe"},
                     return_timestamps=True,
                 )
+
+                chunks = []
+                if isinstance(result, dict):
+                    if "chunks" in result:
+                        chunks = result["chunks"]
+                    elif "text" in result:
+                        chunks = [{
+                            "timestamp": (0, 0),
+                            "text": result["text"],
+                        }]
+                result_holder[0] = {"chunks": chunks}
             except Exception as e:
                 error_holder[0] = e
             finally:
@@ -217,7 +351,7 @@ def transcribe(audio_path: str, num_speakers: int | None, progress=None):
 
         CYCLE = 60.0
         t0 = time.time()
-        while not asr_done.wait(timeout=2):
+        while not asr_done.wait(timeout=5):
             elapsed = time.time() - t0
             frac = (elapsed % CYCLE) / CYCLE
             elapsed_str = f"{int(elapsed // 60)}분 {int(elapsed % 60)}초 경과"
@@ -229,6 +363,16 @@ def transcribe(audio_path: str, num_speakers: int | None, progress=None):
             raise error_holder[0]
 
         chunks = result_holder[0].get("chunks", [])
+
+        # 환각 필터링
+        filtered_chunks = []
+        for chunk in chunks:
+            text = chunk.get("text", "").strip()
+            if text and not is_hallucination(text):
+                filtered_chunks.append(chunk)
+
+        chunks = filtered_chunks
+
         if not chunks:
             yield "전사 결과가 없습니다. 오디오를 확인해 주세요.", None
             return
@@ -265,7 +409,7 @@ def transcribe(audio_path: str, num_speakers: int | None, progress=None):
         threading.Thread(target=_run_diarize, daemon=True).start()
 
         t0 = time.time()
-        while not diarize_done.wait(timeout=2):
+        while not diarize_done.wait(timeout=5):
             elapsed = time.time() - t0
             frac = (elapsed % CYCLE) / CYCLE
             elapsed_str = f"{int(elapsed // 60)}분 {int(elapsed % 60)}초 경과"
@@ -358,6 +502,17 @@ with gr.Blocks(title="한국어 STT 녹취록", css=CSS, theme=gr.themes.Soft())
                 minimum=0,
                 maximum=20,
             )
+
+            with gr.Accordion("VAD 고급 설정", open=False):
+                vad_threshold = gr.Slider(
+                    label="VAD 민감도 (0.0~1.0)",
+                    value=0.5,
+                    minimum=0.1,
+                    maximum=0.9,
+                    step=0.1,
+                    info="높을수록 음성만 추출, 낮을수록 노이즈도 포함"
+                )
+
             run_btn = gr.Button("변환 시작", variant="primary")
 
         with gr.Column(scale=2):
@@ -369,9 +524,9 @@ with gr.Blocks(title="한국어 STT 녹취록", css=CSS, theme=gr.themes.Soft())
 
     result_status = gr.Markdown("")
 
-    def run(audio, n_spk, progress=gr.Progress()):
+    def run(audio, n_spk, vad_thresh, progress=gr.Progress()):
         n = int(n_spk) if n_spk and int(n_spk) > 0 else None
-        for preview, path in transcribe(audio, n, progress=progress):
+        for preview, path in transcribe(audio, n, vad_thresh, progress=progress):
             if path is None:
                 yield preview, None, ""
             else:
@@ -379,11 +534,13 @@ with gr.Blocks(title="한국어 STT 녹취록", css=CSS, theme=gr.themes.Soft())
 
     run_btn.click(
         fn=run,
-        inputs=[audio_input, num_speakers],
+        inputs=[audio_input, num_speakers, vad_threshold],
         outputs=[output_text, file_output, result_status],
     )
 
 if __name__ == "__main__":
     print(f"Gradio 서버 시작 중... http://localhost:7860", flush=True)
-    demo.queue()
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=False, inbrowser=True)
+    os.environ["GRADIO_QUEUE_CONCURRENCY_COUNT"] = "1"
+    os.environ["GRADIO_QUEUE_DEFAULT_CONCURRENCY"] = "1"
+    demo.queue(max_size=20, api_open=False)
+    demo.launch(server_name="0.0.0.0", server_port=7860, share=False, inbrowser=True, show_error=True)
